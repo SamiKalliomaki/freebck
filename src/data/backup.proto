@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package freebck.data.backup;
+
+message Snapshot {
+    string root_hash = 1;
+}
+
+message DirEntry {
+    repeated SubDirEntry sub_dir = 1;
+    repeated FileEntry file = 2;
+}
+
+message SubDirEntry {
+    string name = 1;
+
+    oneof content {
+        string hash = 2;
+        DirEntry inline = 3;
+    }
+}
+
+message FileEntry {
+    string name = 1;
+    string content_hash = 2;
+    fixed64 size = 3;
+    sfixed64 modified = 4;
+}

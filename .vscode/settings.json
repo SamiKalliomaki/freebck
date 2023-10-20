@@ -1,0 +1,12 @@
+{
+    "rust-analyzer.linkedProjects": [
+        ".\\Cargo.toml"
+    ],
+    "rust-analyzer.runnables.extraEnv": [
+        {
+            "env": {
+                "RUST_LOG": "debug"
+            }
+        }
+    ]
+}
