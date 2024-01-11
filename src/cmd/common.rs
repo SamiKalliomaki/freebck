@@ -26,6 +26,8 @@ pub struct CommonArgs {
 pub enum CommandErrorKind {
     /// An error that is caused by the user.
     User,
+    /// An error that is caused by invalid backup data.
+    Corrupt,
     /// An error that is caused by the program.
     Program,
     /// An error that is caused by the system.
@@ -97,3 +99,19 @@ impl From<SystemTimeError> for CommandError {
 }
 
 pub type CommandResult<T = ()> = Result<T, CommandError>;
+
+pub trait IntoCommandResult<T> {
+    fn into_command_result(self) -> CommandResult<T>;
+}
+
+impl<T, E> IntoCommandResult<T> for Result<T, E>
+where
+    E: Into<CommandError>,
+{
+    fn into_command_result(self) -> CommandResult<T> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.into()),
+        }
+    }
+}

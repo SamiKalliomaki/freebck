@@ -1,6 +1,7 @@
 pub mod cmd {
     pub mod backup;
     pub mod common;
+    pub mod restore;
 }
 
 pub mod data {

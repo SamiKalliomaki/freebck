@@ -9,6 +9,7 @@ message Snapshot {
 message DirEntry {
     repeated SubDirEntry sub_dir = 1;
     repeated FileEntry file = 2;
+    fixed64 size = 3;
 }
 
 message SubDirEntry {

@@ -17,11 +17,11 @@ use crate::{
 };
 use log::{debug, info};
 
-use super::common::{CommandError, CommandErrorKind, CommandResult, ProgramContext};
+use super::common::*;
 
 pub struct BackupArgs {}
 
-pub async fn backup(context: &ProgramContext, args: BackupArgs) -> CommandResult {
+pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResult {
     info!("Backup starting");
 
     let backup_root_entry = backup_dir(context, &args, &context.backup_target, None)
@@ -70,8 +70,13 @@ async fn backup_dir(
         }
     }
 
+    struct SubDirTaskResult {
+        sub_dir: SubDirEntry,
+        size: u64,
+    }
+
     let mut file_futures: Vec<BoxFuture<CommandResult<FileEntry>>> = Vec::new();
-    let mut sub_dir_futures: Vec<BoxFuture<CommandResult<SubDirEntry>>> = Vec::new();
+    let mut sub_dir_futures: Vec<BoxFuture<CommandResult<SubDirTaskResult>>> = Vec::new();
 
     let mut dir_entries = read_dir(path).await?;
     while let Some(dir_entry) = dir_entries.next_entry().await? {
@@ -97,9 +102,12 @@ async fn backup_dir(
             sub_dir_futures.push(Box::pin(async move {
                 backup_dir(context, &args, &path, sub_dir_entry)
                     .await
-                    .map(|dir_entry| SubDirEntry {
-                        name,
-                        content: Some(Content::Inline(dir_entry)),
+                    .map(|dir_entry| SubDirTaskResult {
+                        size: dir_entry.size,
+                        sub_dir: SubDirEntry {
+                            name,
+                            content: Some(Content::Inline(dir_entry)),
+                        },
                     })
             }));
         } else {
@@ -110,12 +118,23 @@ async fn backup_dir(
         }
     }
 
-    let (mut sub_dir, mut file) =
+    let (sub_dir_tasks, mut file) =
         try_join(try_join_all(sub_dir_futures), try_join_all(file_futures)).await?;
+    let size =
+        sub_dir_tasks.iter().map(|i| i.size).sum::<u64>() + file.iter().map(|i| i.size).sum::<u64>();
+    let mut sub_dir = sub_dir_tasks
+        .into_iter()
+        .map(|i| i.sub_dir)
+        .collect::<Vec<_>>();
+
     sub_dir.sort_by(|a, b| a.name.cmp(&b.name));
     file.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(DirEntry { sub_dir, file })
+    Ok(DirEntry {
+        sub_dir,
+        file,
+        size,
+    })
 }
 
 async fn backup_file(

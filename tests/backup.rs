@@ -26,7 +26,7 @@ async fn test_backup() -> Result<(), Box<dyn Error>> {
             storage,
             backup_target: content_path,
         },
-        BackupArgs {},
+        &BackupArgs {},
     )
     .await?;
 
