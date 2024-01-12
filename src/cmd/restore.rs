@@ -1,20 +1,28 @@
 use std::{
-    io::{self, Cursor},
+    io::Cursor,
+    os::{fd::OwnedFd, unix::prelude::MetadataExt},
     path::PathBuf,
+    time::SystemTime,
 };
 
 use crate::{
     data::backup::{sub_dir_entry, DirEntry, FileEntry, Snapshot, SubDirEntry},
     storage::Collection,
-    util::fs::read_file_from_storage,
+    util::{
+        fs::read_file_from_storage,
+        time::{as_unix_timestamp, system_time_from_unix_timestamp},
+    },
 };
 
-use super::common::{CommandError, CommandErrorKind, CommandResult, ProgramContext};
+use super::common::{
+    CommandError, CommandErrorKind, CommandResult, KeepGoingOrErr, ProgramContext,
+};
 use async_recursion::async_recursion;
 use futures::future::BoxFuture;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use prost::Message;
-use tokio::fs;
+use tokio::fs::{self, OpenOptions};
+use tokio::io;
 
 pub struct RestoreArgs {
     pub snapshot: String,
@@ -43,29 +51,6 @@ pub async fn restore(context: &ProgramContext, args: &RestoreArgs) -> CommandRes
     Ok(())
 }
 
-trait KeepGoingOrErr<E> {
-    fn keep_going_or_err(self, args: &RestoreArgs, target: &PathBuf) -> Result<(), E>;
-}
-
-impl<T, E> KeepGoingOrErr<E> for Result<T, E>
-where
-    E: std::error::Error,
-{
-    fn keep_going_or_err(self, args: &RestoreArgs, target: &PathBuf) -> Result<(), E> {
-        match self {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if args.keep_going {
-                    warn!("Failed to restore {}: {}", target.to_string_lossy(), e);
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            }
-        }
-    }
-}
-
 #[async_recursion]
 async fn restore_dir(
     context: &ProgramContext,
@@ -74,11 +59,11 @@ async fn restore_dir(
     target: &PathBuf,
 ) -> CommandResult {
     match fs::metadata(target).await {
-        Ok(v) => Ok(v),
+        Ok(_) => Ok(()),
         Err(e) => match e.kind() {
-            io::ErrorKind::NotFound => {
+            std::io::ErrorKind::NotFound => {
                 fs::create_dir(target).await?;
-                fs::metadata(target).await
+                Ok(())
             }
             _ => Err(e),
         },
@@ -108,7 +93,9 @@ async fn restore_dir(
             let dir_target = target.join(&name);
             restore_dir(context, args, dir_entry, &dir_target)
                 .await
-                .keep_going_or_err(args, &dir_target)?;
+                .keep_going_or_err(args.keep_going, |e| {
+                    format!("Failed to restore dir {}: {}", dir_target.to_string_lossy(), e)
+                })?;
 
             Ok(())
         }));
@@ -119,7 +106,9 @@ async fn restore_dir(
             let file_target = target.join(&file_entry.name);
             restore_file(context, args, file_entry, &file_target)
                 .await
-                .keep_going_or_err(args, &file_target)?;
+                .keep_going_or_err(args.keep_going, |e| {
+                    format!("Failed to restore file {}: {}", file_target.to_string_lossy(), e)
+                })?;
 
             Ok(())
         }));
@@ -132,8 +121,91 @@ async fn restore_file(
     context: &ProgramContext,
     args: &RestoreArgs,
     file_entry: FileEntry,
-    target: &PathBuf,
+    target_path: &PathBuf,
 ) -> CommandResult {
+    let FileEntry {
+        name,
+        content_hash,
+        size,
+        modified,
+    } = file_entry;
+
+    enum Matches {
+        DoesNotExist,
+        Matches,
+        DoesNotMatch,
+    }
+    let existing_matches = match fs::metadata(target_path).await {
+        Ok(metadata) => 'matches: {
+            let existing_size = metadata.size();
+            let existing_modified = match metadata.modified() {
+                Ok(m) => as_unix_timestamp(m),
+                Err(e) => {
+                    debug!(
+                        "Failed to get modified time for {}: {}",
+                        target_path.to_string_lossy(),
+                        e
+                    );
+                    break 'matches Matches::DoesNotMatch;
+                }
+            };
+
+            if existing_size != size && existing_modified != modified {
+                break 'matches Matches::DoesNotMatch;
+            }
+
+            // TODO: Check hash if requested.
+            Matches::Matches
+        }
+        Err(e) => {
+            debug!(
+                "Failed to get metadata for {}: {}",
+                target_path.to_string_lossy(),
+                e
+            );
+            Matches::DoesNotExist
+        }
+    };
+    match existing_matches {
+        Matches::Matches => return Ok(()),
+        Matches::DoesNotMatch => {
+            if !args.override_files {
+                return Err(CommandError::new(
+                    CommandErrorKind::FileSystemConflict,
+                    format!("{} already exists", target_path.to_string_lossy()),
+                ));
+            }
+        }
+        Matches::DoesNotExist => {}
+    }
+
+    let mut open_options = OpenOptions::new();
+
+    open_options.write(true);
+    if args.override_files {
+        open_options.create(true).truncate(true);
+    } else {
+        open_options.create_new(true);
+    }
+
+    let mut content = context
+        .storage
+        .read(Collection::Blob, &content_hash)
+        .await?;
+    let mut target_file = open_options.open(target_path).await?;
+
+    io::copy(&mut content, &mut target_file).await?;
+
+    let target_file = match target_file.try_into_std() {
+        Ok(f) => f,
+        Err(_) => {
+            return Err(CommandError::new(
+                CommandErrorKind::System,
+                format!("Failed to convert file to std"),
+            ));
+        }
+    };
+    target_file.set_modified(system_time_from_unix_timestamp(modified))?;
 
     Ok(())
 }

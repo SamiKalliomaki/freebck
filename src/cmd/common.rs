@@ -6,6 +6,7 @@ use std::{
 };
 
 use clap::Args;
+use log::warn;
 use tokio::io;
 
 use crate::storage::Storage;
@@ -26,6 +27,8 @@ pub struct CommonArgs {
 pub enum CommandErrorKind {
     /// An error that is caused by the user.
     User,
+    /// Operation was aborted due to conflicting files or directories.
+    FileSystemConflict,
     /// An error that is caused by invalid backup data.
     Corrupt,
     /// An error that is caused by the program.
@@ -112,6 +115,34 @@ where
         match self {
             Ok(v) => Ok(v),
             Err(e) => Err(e.into()),
+        }
+    }
+}
+
+pub trait KeepGoingOrErr<E> {
+    fn keep_going_or_err<F>(self, keep_going: bool, f: F) -> Result<(), E>
+    where
+        F: FnOnce(E) -> String;
+}
+
+impl<T, E> KeepGoingOrErr<E> for Result<T, E>
+where
+    E: std::error::Error,
+{
+    fn keep_going_or_err<F>(self, keep_going: bool, f: F) -> Result<(), E>
+    where
+        F: FnOnce(E) -> String,
+    {
+        match self {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if keep_going {
+                    warn!("{}", f(e));
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 }

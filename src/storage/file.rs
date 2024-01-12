@@ -1,7 +1,7 @@
 use std::mem::ManuallyDrop;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
+use std::pin::{pin, Pin};
 
 use log::warn;
 use tokio::{
@@ -66,49 +66,64 @@ struct RenameOnDropFile {
     new_path: PathBuf,
 }
 
+impl RenameOnDropFile {
+    /// Structural pin projection. This is safe because we never move the
+    /// `File` out of the `ManuallyDrop`.
+    fn pin_get_file(self: Pin<&mut Self>) -> Pin<&mut File> {
+        unsafe { Pin::new_unchecked(self.get_unchecked_mut().file.deref_mut()) }
+    }
+}
+
 impl AsyncWrite for RenameOnDropFile {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        pin!(self.get_mut().file.deref_mut()).poll_write(cx, buf)
+        self.pin_get_file().poll_write(cx, buf)
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        pin!(self.get_mut().file.deref_mut()).poll_flush(cx)
+        self.pin_get_file().poll_flush(cx)
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        pin!(self.get_mut().file.deref_mut()).poll_shutdown(cx)
+        self.pin_get_file().poll_shutdown(cx)
     }
 }
 
 impl Drop for RenameOnDropFile {
     fn drop(&mut self) {
-        unsafe {
-            ManuallyDrop::drop(&mut self.file);
-        }
+        inner_drop(unsafe { Pin::new_unchecked(self) });
 
-        match std::fs::rename(&self.tmp_path, &self.new_path) {
-            Ok(()) => {}
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::AlreadyExists => {
-                    warn!(
-                        "Cannot finish writing, file already exists: {}",
-                        self.new_path.display()
-                    );
-                }
-                _ => {
-                    panic!("Failed to rename file: {}", e);
-                }
-            },
+        fn inner_drop(mut this: Pin<&mut RenameOnDropFile>) {
+            unsafe {
+                ManuallyDrop::drop(&mut this.file);
+            }
+
+            match std::fs::rename(&this.tmp_path, &this.new_path) {
+                Ok(()) => {}
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => {
+                        // The most likely reason someone else already wrote the file.
+                        // The filename is based on the hash of the contents so this should be
+                        // safe.
+                        warn!(
+                            "Cannot finish writing, file already exists: {}",
+                            this.new_path.display()
+                        );
+                    }
+                    _ => {
+                        panic!("Failed to rename file: {}", e);
+                    }
+                },
+            }
         }
     }
 }
@@ -158,17 +173,17 @@ impl Storage for FileStorage {
         Ok(Box::pin(file))
     }
 
-    // Iterate over directory structure like
-    //
-    // collection:
-    //  - foo:
-    //    - bar
-    //    - baz
-    //  - qux:
-    //    - quux
-    //    - quuz
-    //
-    // And produces a list like ["foobar", "foobaz", "quxquux", "quxquuz"].
+    /// Iterate over directory structure like
+    ///
+    /// collection:
+    ///  - foo:
+    ///    - bar
+    ///    - baz
+    ///  - qux:
+    ///    - quux
+    ///    - quuz
+    ///
+    /// And produces a list like ["foobar", "foobaz", "quxquux", "quxquuz"].
     async fn get_collection_items(
         &self,
         collection: Collection,
