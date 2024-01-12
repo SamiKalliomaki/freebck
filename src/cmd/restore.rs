@@ -1,9 +1,4 @@
-use std::{
-    io::Cursor,
-    os::{fd::OwnedFd, unix::prelude::MetadataExt},
-    path::PathBuf,
-    time::SystemTime,
-};
+use std::{io::Cursor, os::unix::prelude::MetadataExt, path::PathBuf};
 
 use crate::{
     data::backup::{sub_dir_entry, DirEntry, FileEntry, Snapshot, SubDirEntry},
@@ -19,7 +14,7 @@ use super::common::{
 };
 use async_recursion::async_recursion;
 use futures::future::BoxFuture;
-use log::{debug, warn};
+use log::debug;
 use prost::Message;
 use tokio::fs::{self, OpenOptions};
 use tokio::io;
@@ -94,7 +89,11 @@ async fn restore_dir(
             restore_dir(context, args, dir_entry, &dir_target)
                 .await
                 .keep_going_or_err(args.keep_going, |e| {
-                    format!("Failed to restore dir {}: {}", dir_target.to_string_lossy(), e)
+                    format!(
+                        "Failed to restore dir {}: {}",
+                        dir_target.to_string_lossy(),
+                        e
+                    )
                 })?;
 
             Ok(())
@@ -107,7 +106,11 @@ async fn restore_dir(
             restore_file(context, args, file_entry, &file_target)
                 .await
                 .keep_going_or_err(args.keep_going, |e| {
-                    format!("Failed to restore file {}: {}", file_target.to_string_lossy(), e)
+                    format!(
+                        "Failed to restore file {}: {}",
+                        file_target.to_string_lossy(),
+                        e
+                    )
                 })?;
 
             Ok(())
@@ -124,7 +127,7 @@ async fn restore_file(
     target_path: &PathBuf,
 ) -> CommandResult {
     let FileEntry {
-        name,
+        name: _,
         content_hash,
         size,
         modified,

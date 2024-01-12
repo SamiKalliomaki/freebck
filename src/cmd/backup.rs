@@ -120,8 +120,8 @@ async fn backup_dir(
 
     let (sub_dir_tasks, mut file) =
         try_join(try_join_all(sub_dir_futures), try_join_all(file_futures)).await?;
-    let size =
-        sub_dir_tasks.iter().map(|i| i.size).sum::<u64>() + file.iter().map(|i| i.size).sum::<u64>();
+    let size = sub_dir_tasks.iter().map(|i| i.size).sum::<u64>()
+        + file.iter().map(|i| i.size).sum::<u64>();
     let mut sub_dir = sub_dir_tasks
         .into_iter()
         .map(|i| i.sub_dir)
