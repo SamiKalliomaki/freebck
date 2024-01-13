@@ -1,16 +1,19 @@
 use async_recursion::async_recursion;
 use clap::Args;
+use log::warn;
 use prost::Message;
 use sha2::Digest;
 use sha2::Sha256;
+use std::time::SystemTime;
 use std::{collections::HashMap, path::Path, pin::pin};
 
 use futures::future::{try_join, try_join_all, BoxFuture};
 use tokio::{
     fs::{self, read_dir, File},
-    io::{self, AsyncSeekExt, AsyncReadExt},
+    io::{self, AsyncReadExt, AsyncSeekExt},
 };
 
+use crate::constants::CHUNK_SIZE;
 use crate::{
     data::backup::{sub_dir_entry::Content, DirEntry, FileEntry, Snapshot, SubDirEntry},
     storage::Collection,
@@ -44,7 +47,9 @@ impl<T> IgnoreAlreadyExists for io::Result<T> {
 
 pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResult {
     info!("Backup starting");
+    let started = as_unix_timestamp(SystemTime::now());
 
+    // Create a backup entry and write it to the storage.
     let backup_root_entry = backup_dir(context, &args, &context.backup_target, None)
         .await?
         .encode_to_vec();
@@ -56,16 +61,67 @@ pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResul
         .await
         .ignore_already_exists()?;
 
-    let snapshot = Snapshot { root_hash };
-    context
-        .storage
-        .write(Collection::Snapshot, "latest", snapshot.encode_to_vec().as_slice())
-        .await
-        .ignore_already_exists()?;
+    let finished = as_unix_timestamp(SystemTime::now());
+    let snapshot = Snapshot {
+        root_hash,
+        started,
+        finished,
+    };
 
-    info!("Backup complete");
+    const MAX_LOOP_ITERATIONS: u32 = 100;
+    for _ in 0..MAX_LOOP_ITERATIONS {
+        // Find the highest snapshot number.
+        let snapshots = context
+            .storage
+            .get_collection_items(Collection::Snapshot)
+            .await?;
+        let mut highest_snapshot: u32 = 0;
+        for snapshot_name in snapshots {
+            let parts: Vec<_> = snapshot_name.split('/').collect();
+            if parts.len() != 2 {
+                warn!("Invalid snapshot name: {}", snapshot_name);
+                continue;
+            }
 
-    Ok(())
+            if parts[0] != context.archive_config.name {
+                continue;
+            }
+            if let Ok(snapshot_number) = parts[1].parse::<u32>() {
+                highest_snapshot = highest_snapshot.max(snapshot_number);
+            }
+        }
+
+        // Create a snapshot entry and write it to the storage.
+        let snapshot_name = format!("{}/{}", context.archive_config.name, highest_snapshot + 1);
+        match context
+            .storage
+            .write(
+                Collection::Snapshot,
+                snapshot_name.as_str(),
+                snapshot.encode_to_vec().as_slice(),
+            )
+            .await
+        {
+            Ok(_) => {
+                // Backup complete.
+                info!("Backup complete");
+                return Ok(());
+            }
+            Err(e) => {
+                if e.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
+    Err(CommandError::new(
+        CommandErrorKind::Program,
+        format!(
+            "Failed to create snapshot after {} iterations",
+            MAX_LOOP_ITERATIONS
+        ),
+    ))
 }
 
 #[async_recursion]
@@ -175,35 +231,59 @@ async fn backup_file(
         }
     }
 
-    // TODO: Split file into chunks.
     let mut file = pin!(File::open(path).await?);
     let content_hash = read_hash(file.as_mut()).await?;
-    file.seek(io::SeekFrom::Start(0)).await?;
 
     if let Some(previous_snapshot) = previous_snapshot {
         if previous_snapshot.content_hash == content_hash {
             return Ok(FileEntry {
                 name,
                 content_hash,
+                chunk_hash: previous_snapshot.chunk_hash.clone(),
                 size,
                 modified,
             });
         }
     }
 
-    let mut buffer = Vec::new(); // TODO: Setup a pool of buffers.
-    file.read_to_end(&mut buffer).await?;
-    drop(file);
+    file.seek(io::SeekFrom::Start(0)).await?;
+    let mut buffer: Vec<u8> = vec![0; CHUNK_SIZE];
+    let mut chunk_hashes = Vec::new();
 
-    context
-        .storage
-        .write(Collection::Blob, &content_hash, buffer.as_slice())
-        .await?;
+    loop {
+        let bytes_read = read_chunk(&mut file, &mut buffer).await?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let chunk_content = &buffer[..bytes_read];
+        let hash = format!("{:x}", Sha256::digest(chunk_content));
+        chunk_hashes.push(hash.clone());
+
+        context
+            .storage
+            .write(Collection::Blob, &hash, chunk_content)
+            .await?;
+    }
 
     Ok(FileEntry {
         name,
         content_hash,
+        chunk_hash: chunk_hashes,
         size,
         modified,
     })
+}
+
+async fn read_chunk(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut bytes_read = 0;
+    while bytes_read < CHUNK_SIZE {
+        let extra_bytes = file.read(&mut buffer[bytes_read..]).await?;
+        if extra_bytes == 0 {
+            break;
+        }
+        bytes_read += extra_bytes;
+    }
+
+    return Ok(bytes_read);
 }

@@ -5,18 +5,18 @@ use std::{
     time::SystemTimeError,
 };
 
-
 use log::warn;
 use tokio::io;
 
-use crate::storage::Storage;
+use crate::{data::config::ArchiveConfig, storage::Storage};
 
 pub struct ProgramContext {
+    pub archive_config: ArchiveConfig,
     pub storage: Box<dyn Storage>,
     pub backup_target: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CommandErrorKind {
     /// An error that is caused by the user.
     User,
@@ -41,12 +41,12 @@ impl CommandError {
     pub fn with_source(
         error_type: CommandErrorKind,
         message: String,
-        source: Option<Box<dyn Error + Send>>,
+        source: Box<dyn Error + Send>,
     ) -> Self {
         CommandError {
             error_type,
             message,
-            source,
+            source: Some(source),
         }
     }
 
@@ -56,6 +56,10 @@ impl CommandError {
             message,
             source: None,
         }
+    }
+
+    pub fn with_message(self: Self, message: String) -> Self {
+        CommandError::with_source(self.error_type.clone(), message, Box::new(self))
     }
 }
 
@@ -113,18 +117,18 @@ where
 }
 
 pub trait KeepGoingOrErr<E> {
-    fn keep_going_or_err<F>(self, keep_going: bool, f: F) -> Result<(), E>
+    fn keep_going_or_err<F>(self, keep_going: bool, f: F) -> CommandResult
     where
-        F: FnOnce(E) -> String;
+        F: FnOnce(E) -> CommandError;
 }
 
 impl<T, E> KeepGoingOrErr<E> for Result<T, E>
 where
     E: std::error::Error,
 {
-    fn keep_going_or_err<F>(self, keep_going: bool, f: F) -> Result<(), E>
+    fn keep_going_or_err<F>(self, keep_going: bool, f: F) -> CommandResult
     where
-        F: FnOnce(E) -> String,
+        F: FnOnce(E) -> CommandError,
     {
         match self {
             Ok(_) => Ok(()),
@@ -133,7 +137,7 @@ where
                     warn!("{}", f(e));
                     Ok(())
                 } else {
-                    Err(e)
+                    Err(f(e))
                 }
             }
         }

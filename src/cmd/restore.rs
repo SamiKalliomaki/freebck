@@ -33,19 +33,31 @@ pub struct RestoreArgs {
 pub async fn restore(context: &ProgramContext, args: &RestoreArgs) -> CommandResult {
     info!("Restore starting");
 
-    let mut snapshot_buf = Vec::new(); // TODO: Setup a pool of buffers.
-    context
+    let snapshot_name = format!("{}/{}", context.archive_config.name, args.snapshot);
+
+    let mut snapshot_buf = Vec::new();
+    if let Err(e) = context
         .storage
-        .read(Collection::Snapshot, &args.snapshot, &mut snapshot_buf)
-        .await?;
+        .read(Collection::Snapshot, &snapshot_name, &mut snapshot_buf)
+        .await
+    {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Err(CommandError::new(
+                CommandErrorKind::User,
+                format!("Snapshot not found {}", snapshot_name),
+            ));
+        } else {
+            return Err(e.into());
+        }
+    }
     let snapshot = Snapshot::decode(Cursor::new(snapshot_buf)).map_err(|e| {
         CommandError::with_source(
             CommandErrorKind::Corrupt,
-            format!("Error decoding snapshot: {}", e),
-            Some(Box::new(e)),
+            format!("Error decoding snapshot"),
+            Box::new(e),
         )
     })?;
-    let root_dir_entry = get_dir_entry(context, snapshot.root_hash.as_str()).await?;
+    let root_dir_entry = get_dir_entry(context, &snapshot.root_hash).await?;
 
     restore_dir(context, args, root_dir_entry, &context.backup_target).await?;
 
@@ -67,7 +79,7 @@ async fn restore_dir(
             if !metadata.file_type().is_dir() {
                 Err(CommandError::new(
                     CommandErrorKind::FileSystemConflict,
-                    format!("Target {} exists and is not a directory", target.display()),
+                    format!("Target exists and is not a directory {}", target.display()),
                 ))
             } else {
                 Ok(())
@@ -90,26 +102,25 @@ async fn restore_dir(
 
     let mut results: Vec<BoxFuture<CommandResult>> = Vec::new();
     for SubDirEntry { name, content, .. } in sub_dirs.into_iter() {
+        let dir_target = target.join(&name);
         let content = content.ok_or_else(|| {
             CommandError::new(
                 CommandErrorKind::Corrupt,
-                format!("Sub dir entry without content {}", target.display()),
+                format!("Sub dir entry without content {}", dir_target.display()),
             )
         })?;
 
         results.push(Box::pin(async move {
             let dir_entry = match content {
                 sub_dir_entry::Content::Inline(dir_entry) => Ok(dir_entry),
-                sub_dir_entry::Content::Hash(hash) => get_dir_entry(context, hash.as_ref()).await,
+                sub_dir_entry::Content::Hash(hash) => get_dir_entry(context, &hash).await,
             }?;
 
-            let dir_target = target.join(&name);
             restore_dir(context, args, dir_entry, &dir_target)
                 .await
                 .keep_going_or_err(args.keep_going, |e| {
-                    format!("Failed to restore dir {}: {}", dir_target.display(), e)
+                    e.with_message(format!("Failed to restore dir {}", dir_target.display()))
                 })?;
-
             Ok(())
         }));
     }
@@ -120,9 +131,8 @@ async fn restore_dir(
             restore_file(context, args, file_entry, &file_target)
                 .await
                 .keep_going_or_err(args.keep_going, |e| {
-                    format!("Failed to restore file {}: {}", file_target.display(), e)
+                    e.with_message(format!("Failed to restore file {}", file_target.display()))
                 })?;
-
             Ok(())
         }));
     }
@@ -140,9 +150,10 @@ async fn restore_file(
 ) -> CommandResult {
     let FileEntry {
         name: _,
-        content_hash,
+        chunk_hash: chunk_hashes,
         size,
         modified,
+        ..
     } = file_entry;
 
     debug!("Restoring file {}", target_path.display());
@@ -207,15 +218,23 @@ async fn restore_file(
         open_options.create_new(true);
     }
 
-    let mut buffer = Vec::new(); // TODO: Setup a pool of buffers.
-    context
-        .storage
-        .read(Collection::Blob, &content_hash, &mut buffer)
-        .await?;
-
     let mut target_file = open_options.open(target_path).await?;
-    target_file.write_all(&buffer).await?;
-    target_file.flush().await?;
+
+    let mut buffer = Vec::new(); // TODO: Setup a pool of buffers.
+    for chunk_hash in chunk_hashes.into_iter() {
+        context
+            .storage
+            .read(Collection::Blob, &chunk_hash, &mut buffer)
+            .await
+            .keep_going_or_err(args.keep_going, |e| {
+                CommandError::with_source(
+                    CommandErrorKind::Corrupt,
+                    format!("Failed to read chunk {}", chunk_hash),
+                    Box::new(e),
+                )
+            })?;
+        target_file.write_all(&buffer).await?;
+    }
 
     let target_file = target_file.into_std().await;
     target_file.set_modified(system_time_from_unix_timestamp(modified)?)?;
@@ -236,7 +255,7 @@ pub async fn get_dir_entry(context: &ProgramContext, hash: &str) -> CommandResul
         CommandError::with_source(
             CommandErrorKind::Corrupt,
             format!("Error decoding dir entry: {}", e),
-            Some(Box::new(e)),
+            Box::new(e),
         )
     })?;
 

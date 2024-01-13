@@ -4,6 +4,8 @@ package freebck.data.backup;
 
 message Snapshot {
     string root_hash = 1;
+    sfixed64 started = 2;
+    sfixed64 finished = 3;
 }
 
 message DirEntry {
@@ -23,7 +25,10 @@ message SubDirEntry {
 
 message FileEntry {
     string name = 1;
+
     string content_hash = 2;
-    fixed64 size = 3;
-    sfixed64 modified = 4;
+    repeated string chunk_hash = 3;
+
+    fixed64 size = 4;
+    sfixed64 modified = 5;
 }
