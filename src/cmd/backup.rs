@@ -247,7 +247,7 @@ async fn backup_file(
     }
 
     file.seek(io::SeekFrom::Start(0)).await?;
-    let mut buffer: Box<[u8; CHUNK_SIZE]> = Box::new([0; CHUNK_SIZE]);
+    let mut buffer: Vec<u8> = vec![0; CHUNK_SIZE];
     let mut chunk_hashes = Vec::new();
 
     loop {
