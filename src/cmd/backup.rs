@@ -251,17 +251,18 @@ async fn backup_file(
     let mut chunk_hashes = Vec::new();
 
     loop {
-        let bytes_read = read_chunk(&mut file, buffer.as_mut_slice()).await?;
-        if bytes_read == 0 {
+        let mut chunk = file.as_mut().take(CHUNK_SIZE as u64);
+
+        buffer.clear();
+        io::copy(&mut chunk, &mut buffer).await?;
+        if buffer.len() == 0 {
             break;
         }
 
-        let chunk_content = &buffer[..bytes_read];
-        let hash = format!("{:x}", Sha256::digest(chunk_content));
-
+        let hash = format!("{:x}", Sha256::digest(&buffer));
         context
             .storage
-            .write(Collection::Blob, &hash, chunk_content)
+            .write(Collection::Blob, &hash, &buffer)
             .await?;
         chunk_hashes.push(hash);
     }
@@ -273,17 +274,4 @@ async fn backup_file(
         size,
         modified,
     })
-}
-
-async fn read_chunk(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
-    let mut bytes_read = 0;
-    while bytes_read < CHUNK_SIZE {
-        let extra_bytes = file.read(&mut buffer[bytes_read..]).await?;
-        if extra_bytes == 0 {
-            break;
-        }
-        bytes_read += extra_bytes;
-    }
-
-    return Ok(bytes_read);
 }
