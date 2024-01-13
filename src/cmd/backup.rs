@@ -258,12 +258,12 @@ async fn backup_file(
 
         let chunk_content = &buffer[..bytes_read];
         let hash = format!("{:x}", Sha256::digest(chunk_content));
-        chunk_hashes.push(hash.clone());
 
         context
             .storage
             .write(Collection::Blob, &hash, chunk_content)
             .await?;
+        chunk_hashes.push(hash);
     }
 
     Ok(FileEntry {
