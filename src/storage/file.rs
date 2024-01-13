@@ -3,25 +3,21 @@ use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use async_recursion::async_recursion;
 use log::warn;
 use tokio::{
-    fs::{self, read_dir, DirEntry, File, OpenOptions},
-    io::{self, AsyncWrite},
+    fs::{self, read_dir, File, OpenOptions},
+    io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt},
 };
 
 use async_trait::async_trait;
 
-use futures::{
-    channel::mpsc::{self, Sender},
-    stream::{self},
-    SinkExt,
-};
 use rand::distributions::{Alphanumeric, DistString};
 
 use crate::util::fs::sanitize_os_string;
 
 use super::util::xor_byte_hash;
-use super::{Collection, SafeAsyncWrite, Storage, StorageItems, StorageRead, StorageWrite};
+use super::{Collection, Storage, StorageItems, StorageRead, StorageWrite};
 
 pub struct FileStorage {
     root: PathBuf,
@@ -116,8 +112,14 @@ impl AsyncWrite for RenameOnFinishFile {
 }
 
 #[async_trait]
+pub trait SafeAsyncWrite: AsyncWrite {
+    async fn finish(self: Self) -> io::Result<()>;
+}
+
+#[async_trait]
 impl SafeAsyncWrite for RenameOnFinishFile {
-    async fn finish(mut self: Pin<Box<Self>>) -> io::Result<()> {
+    async fn finish(mut self: Self) -> io::Result<()> {
+        self.file.sync_all().await?;
         unsafe {
             ManuallyDrop::drop(&mut self.file);
         }
@@ -126,11 +128,8 @@ impl SafeAsyncWrite for RenameOnFinishFile {
         match fs::rename(&self.tmp_path, &self.new_path).await {
             Ok(()) => {}
             Err(e) => {
-                match fs::remove_file(&self.tmp_path).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("Failed to remove temp file: {}", e);
-                    }
+                if let Err(e) = fs::remove_file(&self.tmp_path).await {
+                    warn!("Failed to remove temp file: {}", e);
                 }
 
                 return Err(e);
@@ -143,6 +142,12 @@ impl SafeAsyncWrite for RenameOnFinishFile {
 
 impl Drop for RenameOnFinishFile {
     fn drop(&mut self) {
+        if !self.cleaned_up {
+            if let Err(e) = std::fs::remove_file(&self.tmp_path) {
+                warn!("Failed to remove temp file: {}", e);
+            }
+        }
+
         assert!(
             self.cleaned_up,
             "File was dropped without finish being called"
@@ -152,7 +157,7 @@ impl Drop for RenameOnFinishFile {
 
 #[async_trait]
 impl Storage for FileStorage {
-    async fn write(&self, collection: Collection, key: &str) -> StorageWrite {
+    async fn write(&self, collection: Collection, key: &str, data: &[u8]) -> StorageWrite {
         let path = get_item_path(&self.root, collection, key)?;
         match fs::metadata(&path).await {
             Ok(_) => {
@@ -173,13 +178,19 @@ impl Storage for FileStorage {
             }
         }
 
-        Ok(Box::pin(RenameOnFinishFile::new(tmp_path, path).await?))
+        let mut file = RenameOnFinishFile::new(tmp_path, path).await?;
+        file.write_all(data).await?;
+        file.finish().await?;
+
+        Ok(())
     }
 
-    async fn read(&self, collection: Collection, key: &str) -> StorageRead {
+    async fn read(&self, collection: Collection, key: &str, buffer: &mut Vec<u8>) -> StorageRead {
         let path = get_item_path(&self.root, collection, key)?;
-        let file = File::open(path).await?;
-        Ok(Box::pin(file))
+        let mut file = File::open(path).await?;
+        buffer.clear();
+        file.read_to_end(buffer).await?;
+        Ok(())
     }
 
     /// Iterate over directory structure like
@@ -196,50 +207,27 @@ impl Storage for FileStorage {
     async fn get_collection_items(&self, collection: Collection) -> StorageItems {
         let path = get_collection_path(&self.root, collection);
         if !path.exists() {
-            return Ok(Box::pin(stream::empty()));
+            return Ok(Vec::new());
         }
 
-        let mut dir_entries = read_dir(path).await?;
-        let (mut tx, rx) = mpsc::channel::<io::Result<String>>(16);
+        #[async_recursion]
+        async fn iterate_dir(items: &mut Vec<String>, path: PathBuf) -> io::Result<()> {
+            let mut dir_entries = read_dir(path).await?;
+            while let Some(dir_entry) = dir_entries.next_entry().await? {
+                let file_type = dir_entry.file_type().await?;
 
-        async fn iterate_sub_dir(
-            tx: &mut Sender<io::Result<String>>,
-            sub_dir: DirEntry,
-        ) -> io::Result<()> {
-            let mut sub_dir_entries = read_dir(sub_dir.path()).await?;
-
-            while let Some(dir_entry) = sub_dir_entries.next_entry().await? {
-                let file_name = sanitize_os_string(dir_entry.file_name())?;
-                tx.feed(Ok(file_name))
-                    .await
-                    .unwrap();
+                if file_type.is_dir() {
+                    iterate_dir(items, dir_entry.path()).await?;
+                } else if file_type.is_file() {
+                    items.push(sanitize_os_string(dir_entry.file_name())?);
+                }
             }
-
             Ok(())
         }
 
-        tokio::spawn(async move {
-            loop {
-                match dir_entries.next_entry().await {
-                    Err(e) => {
-                        tx.feed(Err(e)).await.unwrap();
-                        return;
-                    }
-                    Ok(None) => {
-                        return;
-                    }
-                    Ok(Some(dir_entry)) => match iterate_sub_dir(&mut tx, dir_entry).await {
-                        Err(e) => {
-                            tx.feed(Err(e)).await.unwrap();
-                            return;
-                        }
-                        Ok(()) => {}
-                    },
-                }
-            }
-        });
-
-        Ok(Box::pin(rx))
+        let mut items: Vec<String> = Vec::new();
+        iterate_dir(&mut items, path).await?;
+        Ok(items)
     }
 }
 

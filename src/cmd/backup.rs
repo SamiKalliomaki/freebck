@@ -8,7 +8,7 @@ use std::{collections::HashMap, path::Path, pin::pin};
 use futures::future::{try_join, try_join_all, BoxFuture};
 use tokio::{
     fs::{self, read_dir, File},
-    io::{self, AsyncSeekExt, AsyncWriteExt},
+    io::{self, AsyncSeekExt, AsyncReadExt},
 };
 
 use crate::{
@@ -50,21 +50,18 @@ pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResul
         .encode_to_vec();
     let root_hash = format!("{:x}", Sha256::digest(&backup_root_entry));
 
-    let mut dir_entry_file = context.storage.write(Collection::Blob, &root_hash).await?;
-    dir_entry_file
-        .write_all(backup_root_entry.as_slice())
-        .await?;
-    dir_entry_file.finish().await.ignore_already_exists()?;
+    context
+        .storage
+        .write(Collection::Blob, &root_hash, backup_root_entry.as_slice())
+        .await
+        .ignore_already_exists()?;
 
     let snapshot = Snapshot { root_hash };
-    let mut snapshot_file = context
+    context
         .storage
-        .write(Collection::Snapshot, "latest")
-        .await?;
-    snapshot_file
-        .write_all(snapshot.encode_to_vec().as_slice())
-        .await?;
-    snapshot_file.finish().await?;
+        .write(Collection::Snapshot, "latest", snapshot.encode_to_vec().as_slice())
+        .await
+        .ignore_already_exists()?;
 
     info!("Backup complete");
 
@@ -178,6 +175,7 @@ async fn backup_file(
         }
     }
 
+    // TODO: Split file into chunks.
     let mut file = pin!(File::open(path).await?);
     let content_hash = read_hash(file.as_mut()).await?;
     file.seek(io::SeekFrom::Start(0)).await?;
@@ -193,12 +191,14 @@ async fn backup_file(
         }
     }
 
-    let mut backup = context
+    let mut buffer = Vec::new(); // TODO: Setup a pool of buffers.
+    file.read_to_end(&mut buffer).await?;
+    drop(file);
+
+    context
         .storage
-        .write(Collection::Blob, &content_hash)
+        .write(Collection::Blob, &content_hash, buffer.as_slice())
         .await?;
-    io::copy(&mut file, &mut backup).await?;
-    backup.finish().await.ignore_already_exists()?;
 
     Ok(FileEntry {
         name,

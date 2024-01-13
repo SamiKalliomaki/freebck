@@ -3,10 +3,7 @@ use std::{io::Cursor, os::unix::prelude::MetadataExt, path::PathBuf};
 use crate::{
     data::backup::{sub_dir_entry, DirEntry, FileEntry, Snapshot, SubDirEntry},
     storage::Collection,
-    util::{
-        fs::read_file_from_storage,
-        time::{as_unix_timestamp, system_time_from_unix_timestamp},
-    },
+    util::time::{as_unix_timestamp, system_time_from_unix_timestamp},
 };
 
 use super::common::{
@@ -14,11 +11,13 @@ use super::common::{
 };
 use async_recursion::async_recursion;
 use clap::Args;
-use futures::future::{BoxFuture, try_join_all};
+use futures::future::{try_join_all, BoxFuture};
 use log::{debug, info};
 use prost::Message;
-use tokio::fs::{self, OpenOptions};
-use tokio::io;
+use tokio::{
+    fs::{self, File, OpenOptions},
+    io::AsyncWriteExt,
+};
 
 #[derive(Debug, Args)]
 pub struct RestoreArgs {
@@ -34,12 +33,11 @@ pub struct RestoreArgs {
 pub async fn restore(context: &ProgramContext, args: &RestoreArgs) -> CommandResult {
     info!("Restore starting");
 
-    let snapshot_buf = read_file_from_storage(
-        context.storage.as_ref(),
-        Collection::Snapshot,
-        &args.snapshot,
-    )
-    .await?;
+    let mut snapshot_buf = Vec::new(); // TODO: Setup a pool of buffers.
+    context
+        .storage
+        .read(Collection::Snapshot, &args.snapshot, &mut snapshot_buf)
+        .await?;
     let snapshot = Snapshot::decode(Cursor::new(snapshot_buf)).map_err(|e| {
         CommandError::with_source(
             CommandErrorKind::Corrupt,
@@ -69,10 +67,7 @@ async fn restore_dir(
             if !metadata.file_type().is_dir() {
                 Err(CommandError::new(
                     CommandErrorKind::FileSystemConflict,
-                    format!(
-                        "Target {} exists and is not a directory",
-                        target.display()
-                    ),
+                    format!("Target {} exists and is not a directory", target.display()),
                 ))
             } else {
                 Ok(())
@@ -112,11 +107,7 @@ async fn restore_dir(
             restore_dir(context, args, dir_entry, &dir_target)
                 .await
                 .keep_going_or_err(args.keep_going, |e| {
-                    format!(
-                        "Failed to restore dir {}: {}",
-                        dir_target.display(),
-                        e
-                    )
+                    format!("Failed to restore dir {}: {}", dir_target.display(), e)
                 })?;
 
             Ok(())
@@ -129,11 +120,7 @@ async fn restore_dir(
             restore_file(context, args, file_entry, &file_target)
                 .await
                 .keep_going_or_err(args.keep_going, |e| {
-                    format!(
-                        "Failed to restore file {}: {}",
-                        file_target.display(),
-                        e
-                    )
+                    format!("Failed to restore file {}: {}", file_target.display(), e)
                 })?;
 
             Ok(())
@@ -220,31 +207,31 @@ async fn restore_file(
         open_options.create_new(true);
     }
 
-    let mut content = context
+    let mut buffer = Vec::new(); // TODO: Setup a pool of buffers.
+    context
         .storage
-        .read(Collection::Blob, &content_hash)
+        .read(Collection::Blob, &content_hash, &mut buffer)
         .await?;
+
     let mut target_file = open_options.open(target_path).await?;
+    target_file.write_all(&buffer).await?;
+    target_file.flush().await?;
 
-    io::copy(&mut content, &mut target_file).await?;
-
-    let target_file = match target_file.try_into_std() {
-        Ok(f) => f,
-        Err(_) => {
-            return Err(CommandError::new(
-                CommandErrorKind::System,
-                format!("Failed to convert file to std"),
-            ));
-        }
-    };
+    let target_file = target_file.into_std().await;
     target_file.set_modified(system_time_from_unix_timestamp(modified)?)?;
+
+    let target_file = File::from_std(target_file);
+    target_file.sync_all().await?;
 
     Ok(())
 }
 
 pub async fn get_dir_entry(context: &ProgramContext, hash: &str) -> CommandResult<DirEntry> {
-    let dir_entry_buf =
-        read_file_from_storage(context.storage.as_ref(), Collection::Blob, hash).await?;
+    let mut dir_entry_buf = Vec::new(); // TODO: Setup a pool of buffers.
+    context
+        .storage
+        .read(Collection::Blob, hash, &mut dir_entry_buf)
+        .await?;
     let dir_entry = DirEntry::decode(Cursor::new(dir_entry_buf)).map_err(|e| {
         CommandError::with_source(
             CommandErrorKind::Corrupt,
