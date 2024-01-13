@@ -247,11 +247,11 @@ async fn backup_file(
     }
 
     file.seek(io::SeekFrom::Start(0)).await?;
-    let mut buffer: Vec<u8> = vec![0; CHUNK_SIZE];
+    let mut buffer: Box<[u8; CHUNK_SIZE]> = Box::new([0; CHUNK_SIZE]);
     let mut chunk_hashes = Vec::new();
 
     loop {
-        let bytes_read = read_chunk(&mut file, &mut buffer).await?;
+        let bytes_read = read_chunk(&mut file, buffer.as_mut_slice()).await?;
         if bytes_read == 0 {
             break;
         }
