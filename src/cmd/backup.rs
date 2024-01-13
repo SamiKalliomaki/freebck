@@ -1,4 +1,5 @@
 use async_recursion::async_recursion;
+use clap::Args;
 use prost::Message;
 use sha2::Digest;
 use sha2::Sha256;
@@ -19,7 +20,27 @@ use log::{debug, info};
 
 use super::common::*;
 
+#[derive(Debug, Args)]
 pub struct BackupArgs {}
+
+trait IgnoreAlreadyExists {
+    fn ignore_already_exists(self) -> io::Result<()>;
+}
+
+impl<T> IgnoreAlreadyExists for io::Result<T> {
+    fn ignore_already_exists(self) -> io::Result<()> {
+        match self {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+}
 
 pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResult {
     info!("Backup starting");
@@ -33,7 +54,7 @@ pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResul
     dir_entry_file
         .write_all(backup_root_entry.as_slice())
         .await?;
-    drop(dir_entry_file);
+    dir_entry_file.finish().await.ignore_already_exists()?;
 
     let snapshot = Snapshot { root_hash };
     let mut snapshot_file = context
@@ -43,6 +64,7 @@ pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResul
     snapshot_file
         .write_all(snapshot.encode_to_vec().as_slice())
         .await?;
+    snapshot_file.finish().await?;
 
     info!("Backup complete");
 
@@ -176,6 +198,7 @@ async fn backup_file(
         .write(Collection::Blob, &content_hash)
         .await?;
     io::copy(&mut file, &mut backup).await?;
+    backup.finish().await.ignore_already_exists()?;
 
     Ok(FileEntry {
         name,

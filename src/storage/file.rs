@@ -6,21 +6,22 @@ use std::pin::Pin;
 use log::warn;
 use tokio::{
     fs::{self, read_dir, DirEntry, File, OpenOptions},
-    io::{self, AsyncRead, AsyncWrite},
+    io::{self, AsyncWrite},
 };
 
 use async_trait::async_trait;
 
 use futures::{
     channel::mpsc::{self, Sender},
-    stream::{self, Stream},
+    stream::{self},
     SinkExt,
 };
 use rand::distributions::{Alphanumeric, DistString};
 
 use crate::util::fs::sanitize_os_string;
 
-use super::{Collection, ResultPinBox, Storage};
+use super::util::xor_byte_hash;
+use super::{Collection, SafeAsyncWrite, Storage, StorageItems, StorageRead, StorageWrite};
 
 pub struct FileStorage {
     root: PathBuf,
@@ -56,25 +57,41 @@ fn get_item_path(root: &Path, collection: Collection, key: &str) -> io::Result<P
     }
 
     Ok(get_collection_path(root, collection)
-        .join(&key[0..2])
-        .join(&key[2..]))
+        .join(xor_byte_hash(key.as_bytes()))
+        .join(&key))
 }
 
-struct RenameOnDropFile {
+struct RenameOnFinishFile {
     file: ManuallyDrop<File>,
     tmp_path: PathBuf,
     new_path: PathBuf,
+    cleaned_up: bool,
 }
 
-impl RenameOnDropFile {
+impl RenameOnFinishFile {
+    async fn new(tmp_path: PathBuf, new_path: PathBuf) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .await?;
+
+        Ok(Self {
+            file: ManuallyDrop::new(file),
+            tmp_path,
+            new_path,
+            cleaned_up: false,
+        })
+    }
+
     /// Structural pin projection. This is safe because we never move the
     /// `File` out of the `ManuallyDrop`.
     fn pin_get_file(self: Pin<&mut Self>) -> Pin<&mut File> {
-        unsafe { Pin::new_unchecked(self.get_unchecked_mut().file.deref_mut()) }
+        Pin::new(self.get_mut().file.deref_mut())
     }
 }
 
-impl AsyncWrite for RenameOnDropFile {
+impl AsyncWrite for RenameOnFinishFile {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -98,43 +115,44 @@ impl AsyncWrite for RenameOnDropFile {
     }
 }
 
-impl Drop for RenameOnDropFile {
-    fn drop(&mut self) {
-        inner_drop(unsafe { Pin::new_unchecked(self) });
+#[async_trait]
+impl SafeAsyncWrite for RenameOnFinishFile {
+    async fn finish(mut self: Pin<Box<Self>>) -> io::Result<()> {
+        unsafe {
+            ManuallyDrop::drop(&mut self.file);
+        }
 
-        fn inner_drop(mut this: Pin<&mut RenameOnDropFile>) {
-            unsafe {
-                ManuallyDrop::drop(&mut this.file);
-            }
+        self.cleaned_up = true;
+        match fs::rename(&self.tmp_path, &self.new_path).await {
+            Ok(()) => {}
+            Err(e) => {
+                match fs::remove_file(&self.tmp_path).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Failed to remove temp file: {}", e);
+                    }
+                }
 
-            match std::fs::rename(&this.tmp_path, &this.new_path) {
-                Ok(()) => {}
-                Err(e) => match e.kind() {
-                    std::io::ErrorKind::AlreadyExists => {
-                        // The most likely reason someone else already wrote the file.
-                        // The filename is based on the hash of the contents so this should be
-                        // safe.
-                        warn!(
-                            "Cannot finish writing, file already exists: {}",
-                            this.new_path.display()
-                        );
-                    }
-                    _ => {
-                        panic!("Failed to rename file: {}", e);
-                    }
-                },
+                return Err(e);
             }
         }
+
+        Ok(())
+    }
+}
+
+impl Drop for RenameOnFinishFile {
+    fn drop(&mut self) {
+        assert!(
+            self.cleaned_up,
+            "File was dropped without finish being called"
+        )
     }
 }
 
 #[async_trait]
 impl Storage for FileStorage {
-    async fn write(
-        &self,
-        collection: Collection,
-        key: &str,
-    ) -> ResultPinBox<dyn AsyncWrite + Send> {
+    async fn write(&self, collection: Collection, key: &str) -> StorageWrite {
         let path = get_item_path(&self.root, collection, key)?;
         match fs::metadata(&path).await {
             Ok(_) => {
@@ -155,19 +173,10 @@ impl Storage for FileStorage {
             }
         }
 
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .await?;
-        Ok(Box::pin(RenameOnDropFile {
-            file: ManuallyDrop::new(file),
-            tmp_path,
-            new_path: path,
-        }))
+        Ok(Box::pin(RenameOnFinishFile::new(tmp_path, path).await?))
     }
 
-    async fn read(&self, collection: Collection, key: &str) -> ResultPinBox<dyn AsyncRead + Send> {
+    async fn read(&self, collection: Collection, key: &str) -> StorageRead {
         let path = get_item_path(&self.root, collection, key)?;
         let file = File::open(path).await?;
         Ok(Box::pin(file))
@@ -184,10 +193,7 @@ impl Storage for FileStorage {
     ///    - quuz
     ///
     /// And produces a list like ["foobar", "foobaz", "quxquux", "quxquuz"].
-    async fn get_collection_items(
-        &self,
-        collection: Collection,
-    ) -> ResultPinBox<dyn Stream<Item = io::Result<String>>> {
+    async fn get_collection_items(&self, collection: Collection) -> StorageItems {
         let path = get_collection_path(&self.root, collection);
         if !path.exists() {
             return Ok(Box::pin(stream::empty()));
@@ -200,12 +206,11 @@ impl Storage for FileStorage {
             tx: &mut Sender<io::Result<String>>,
             sub_dir: DirEntry,
         ) -> io::Result<()> {
-            let sub_dir_name = sanitize_os_string(sub_dir.file_name())?;
             let mut sub_dir_entries = read_dir(sub_dir.path()).await?;
 
             while let Some(dir_entry) = sub_dir_entries.next_entry().await? {
                 let file_name = sanitize_os_string(dir_entry.file_name())?;
-                tx.feed(Ok(sub_dir_name.to_owned() + &file_name))
+                tx.feed(Ok(file_name))
                     .await
                     .unwrap();
             }

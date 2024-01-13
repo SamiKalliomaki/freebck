@@ -5,7 +5,7 @@ use std::{
     time::SystemTimeError,
 };
 
-use clap::Args;
+
 use log::warn;
 use tokio::io;
 
@@ -14,13 +14,6 @@ use crate::storage::Storage;
 pub struct ProgramContext {
     pub storage: Box<dyn Storage>,
     pub backup_target: PathBuf,
-}
-
-#[derive(Debug, Args)]
-pub struct CommonArgs {
-    /// Dry run, don't perform any writes.
-    #[arg(long)]
-    dry_run: bool,
 }
 
 #[derive(Debug)]

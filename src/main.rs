@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use freebck::cmd::common::CommonArgs;
+use freebck::cmd::{backup::BackupArgs, restore::RestoreArgs};
 
 /// freebck - The free backup tool
 #[derive(Debug, Parser)]
@@ -12,17 +12,14 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
-
-    #[command(flatten)]
-    common: CommonArgs,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Create a new snapshot.
-    Backup {},
+    Backup(BackupArgs),
     /// Restore from a snapshot.
-    Restore {},
+    Restore(RestoreArgs),
 }
 
 #[tokio::main]

@@ -13,20 +13,27 @@ use super::common::{
     CommandError, CommandErrorKind, CommandResult, KeepGoingOrErr, ProgramContext,
 };
 use async_recursion::async_recursion;
-use futures::future::BoxFuture;
-use log::debug;
+use clap::Args;
+use futures::future::{BoxFuture, try_join_all};
+use log::{debug, info};
 use prost::Message;
 use tokio::fs::{self, OpenOptions};
 use tokio::io;
 
+#[derive(Debug, Args)]
 pub struct RestoreArgs {
     pub snapshot: String,
-    pub target: PathBuf,
-    pub override_files: bool,
+    /// Keep going on errors.
+    #[arg(long)]
     pub keep_going: bool,
+    /// Don't override existing files.
+    #[arg(long)]
+    pub no_override_files: bool,
 }
 
 pub async fn restore(context: &ProgramContext, args: &RestoreArgs) -> CommandResult {
+    info!("Restore starting");
+
     let snapshot_buf = read_file_from_storage(
         context.storage.as_ref(),
         Collection::Snapshot,
@@ -42,7 +49,9 @@ pub async fn restore(context: &ProgramContext, args: &RestoreArgs) -> CommandRes
     })?;
     let root_dir_entry = get_dir_entry(context, snapshot.root_hash.as_str()).await?;
 
-    restore_dir(context, args, root_dir_entry, &args.target).await?;
+    restore_dir(context, args, root_dir_entry, &context.backup_target).await?;
+
+    info!("Restore complete");
     Ok(())
 }
 
@@ -53,14 +62,28 @@ async fn restore_dir(
     root_dir_entry: DirEntry,
     target: &PathBuf,
 ) -> CommandResult {
+    debug!("Restoring dir {}", target.display());
+
     match fs::metadata(target).await {
-        Ok(_) => Ok(()),
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                Err(CommandError::new(
+                    CommandErrorKind::FileSystemConflict,
+                    format!(
+                        "Target {} exists and is not a directory",
+                        target.display()
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        }
         Err(e) => match e.kind() {
             std::io::ErrorKind::NotFound => {
                 fs::create_dir(target).await?;
                 Ok(())
             }
-            _ => Err(e),
+            _ => Err(e.into()),
         },
     }?;
 
@@ -75,7 +98,7 @@ async fn restore_dir(
         let content = content.ok_or_else(|| {
             CommandError::new(
                 CommandErrorKind::Corrupt,
-                format!("Sub dir entry without content {}", target.to_string_lossy()),
+                format!("Sub dir entry without content {}", target.display()),
             )
         })?;
 
@@ -91,7 +114,7 @@ async fn restore_dir(
                 .keep_going_or_err(args.keep_going, |e| {
                     format!(
                         "Failed to restore dir {}: {}",
-                        dir_target.to_string_lossy(),
+                        dir_target.display(),
                         e
                     )
                 })?;
@@ -108,7 +131,7 @@ async fn restore_dir(
                 .keep_going_or_err(args.keep_going, |e| {
                     format!(
                         "Failed to restore file {}: {}",
-                        file_target.to_string_lossy(),
+                        file_target.display(),
                         e
                     )
                 })?;
@@ -116,6 +139,8 @@ async fn restore_dir(
             Ok(())
         }));
     }
+
+    try_join_all(results).await?;
 
     Ok(())
 }
@@ -133,6 +158,8 @@ async fn restore_file(
         modified,
     } = file_entry;
 
+    debug!("Restoring file {}", target_path.display());
+
     enum Matches {
         DoesNotExist,
         Matches,
@@ -146,7 +173,7 @@ async fn restore_file(
                 Err(e) => {
                     debug!(
                         "Failed to get modified time for {}: {}",
-                        target_path.to_string_lossy(),
+                        target_path.display(),
                         e
                     );
                     break 'matches Matches::DoesNotMatch;
@@ -161,21 +188,23 @@ async fn restore_file(
             Matches::Matches
         }
         Err(e) => {
-            debug!(
-                "Failed to get metadata for {}: {}",
-                target_path.to_string_lossy(),
-                e
-            );
+            if e.kind() != std::io::ErrorKind::NotFound {
+                debug!(
+                    "Failed to get metadata for {}: {}",
+                    target_path.display(),
+                    e
+                );
+            }
             Matches::DoesNotExist
         }
     };
     match existing_matches {
         Matches::Matches => return Ok(()),
         Matches::DoesNotMatch => {
-            if !args.override_files {
+            if args.no_override_files {
                 return Err(CommandError::new(
                     CommandErrorKind::FileSystemConflict,
-                    format!("{} already exists", target_path.to_string_lossy()),
+                    format!("{} already exists", target_path.display()),
                 ));
             }
         }
@@ -185,7 +214,7 @@ async fn restore_file(
     let mut open_options = OpenOptions::new();
 
     open_options.write(true);
-    if args.override_files {
+    if args.no_override_files {
         open_options.create(true).truncate(true);
     } else {
         open_options.create_new(true);
@@ -208,7 +237,7 @@ async fn restore_file(
             ));
         }
     };
-    target_file.set_modified(system_time_from_unix_timestamp(modified))?;
+    target_file.set_modified(system_time_from_unix_timestamp(modified)?)?;
 
     Ok(())
 }

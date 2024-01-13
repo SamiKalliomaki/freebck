@@ -23,3 +23,4 @@ prost-build = "0.12.1"
 
 [dev-dependencies]
 test-log = "0.2.13"
+walkdir = "2.4.0"

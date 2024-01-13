@@ -24,7 +24,7 @@ macro_rules! storage_tests {
                     assert_eq!(err.kind(), io::ErrorKind::NotFound);
                 }
             }
-            drop(file_1);
+            file_1.finish().await?;
 
             let mut content = String::new();
             state
@@ -42,11 +42,11 @@ macro_rules! storage_tests {
         async fn get_collection_items_returns_correct_files() -> TestResult {
             let state = <$type>::new().await;
 
-            _ = state.storage.write(Collection::Snapshot, "1_key").await?;
-            _ = state.storage.write(Collection::Snapshot, "2_key").await?;
-            _ = state.storage.write(Collection::Snapshot, "key_3").await?;
-            _ = state.storage.write(Collection::Snapshot, "key_4").await?;
-            _ = state.storage.write(Collection::Blob, "key_5").await?;
+            _ = state.storage.write(Collection::Snapshot, "1_key").await?.finish().await?;
+            _ = state.storage.write(Collection::Snapshot, "2_key").await?.finish().await?;
+            _ = state.storage.write(Collection::Snapshot, "key_3").await?.finish().await?;
+            _ = state.storage.write(Collection::Snapshot, "key_4").await?.finish().await?;
+            _ = state.storage.write(Collection::Blob, "key_5").await?.finish().await?;
 
             let mut snapshot_collection = state
                 .storage
@@ -89,7 +89,7 @@ macro_rules! storage_tests {
         async fn read_unknown_returns_not_found() -> TestResult {
             let state = <$type>::new().await;
 
-            _ = state.storage.write(Collection::Snapshot, "key_1").await?;
+            _ = state.storage.write(Collection::Snapshot, "key_1").await?.finish().await?;
 
             let res = state.storage.read(Collection::Snapshot, "key_2").await;
             match res {
