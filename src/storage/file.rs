@@ -14,9 +14,10 @@ use async_trait::async_trait;
 
 use rand::distributions::{Alphanumeric, DistString};
 
-use crate::util::fs::sanitize_os_string;
+use crate::data::config::FileStorageConfig;
+use crate::storage::util::base16_decode;
 
-use super::util::xor_byte_hash;
+use super::util::{base16_encode, xor_byte_hash};
 use super::{Collection, Storage, StorageItems, StorageRead, StorageWrite};
 
 pub struct FileStorage {
@@ -30,6 +31,11 @@ impl FileStorage {
         fs::create_dir_all(&tmp_dir).await?;
 
         Ok(Self { root, tmp_dir })
+    }
+
+    pub async fn from_config(config_path: &Path, config: &FileStorageConfig) -> io::Result<Self> {
+        let root = config_path.parent().unwrap().join(&config.path);
+        return Self::new(root).await;
     }
 }
 
@@ -54,7 +60,7 @@ fn get_item_path(root: &Path, collection: Collection, key: &str) -> io::Result<P
 
     Ok(get_collection_path(root, collection)
         .join(xor_byte_hash(key.as_bytes()))
-        .join(&key))
+        .join(base16_encode(key)))
 }
 
 struct RenameOnFinishFile {
@@ -219,7 +225,23 @@ impl Storage for FileStorage {
                 if file_type.is_dir() {
                     iterate_dir(items, dir_entry.path()).await?;
                 } else if file_type.is_file() {
-                    items.push(sanitize_os_string(dir_entry.file_name())?);
+                    items.push(match dir_entry.file_name().into_string() {
+                        Ok(file_name) => match base16_decode(&file_name) {
+                            Ok(key) => key,
+                            Err(e) => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("Invalid filename {:?}: {}", file_name, e),
+                                ))
+                            }
+                        },
+                        Err(file_name) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("Invalid UTF-8 in filename: {:?}", file_name),
+                            ))
+                        }
+                    });
                 }
             }
             Ok(())

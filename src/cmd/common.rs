@@ -1,17 +1,20 @@
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
+    io::Cursor,
     path::PathBuf,
-    time::SystemTimeError,
 };
 
-use log::warn;
-use tokio::io;
+use log::{error, warn};
+use prost::Message;
 
-use crate::{data::config::ArchiveConfig, storage::Storage};
+use crate::{
+    data::backup::DirEntry,
+    storage::{Collection, Storage},
+};
 
 pub struct ProgramContext {
-    pub archive_config: ArchiveConfig,
+    pub archive_name: String,
     pub storage: Box<dyn Storage>,
     pub backup_target: PathBuf,
 }
@@ -65,7 +68,7 @@ impl CommandError {
 
 impl Display for CommandError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}: {}", self.error_type, self.message)
+        write!(f, "{}", self.message)
     }
 }
 
@@ -78,40 +81,37 @@ impl Error for CommandError {
     }
 }
 
-impl From<io::Error> for CommandError {
-    fn from(error: io::Error) -> Self {
-        CommandError {
-            error_type: CommandErrorKind::System,
-            message: error.to_string(),
-            source: Some(Box::new(error)),
-        }
-    }
+pub trait IntoCommandError {
+    fn into_command_error(self, kind: CommandErrorKind, message: &str) -> CommandError;
 }
 
-impl From<SystemTimeError> for CommandError {
-    fn from(error: SystemTimeError) -> Self {
-        CommandError {
-            error_type: CommandErrorKind::System,
-            message: error.to_string(),
-            source: Some(Box::new(error)),
-        }
+impl<T> IntoCommandError for T
+where
+    T: std::error::Error + Send + 'static,
+{
+    fn into_command_error(self, kind: CommandErrorKind, message: &str) -> CommandError {
+        CommandError::with_source(kind, message.to_string(), Box::new(self))
     }
 }
 
 pub type CommandResult<T = ()> = Result<T, CommandError>;
 
 pub trait IntoCommandResult<T> {
-    fn into_command_result(self) -> CommandResult<T>;
+    fn into_command_result(self, kind: CommandErrorKind, message: &str) -> CommandResult<T>;
 }
 
 impl<T, E> IntoCommandResult<T> for Result<T, E>
 where
-    E: Into<CommandError>,
+    E: std::error::Error + Send + 'static,
 {
-    fn into_command_result(self) -> CommandResult<T> {
+    fn into_command_result(self, kind: CommandErrorKind, message: &str) -> CommandResult<T> {
         match self {
             Ok(v) => Ok(v),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(CommandError::with_source(
+                kind,
+                message.to_string(),
+                Box::new(e),
+            )),
         }
     }
 }
@@ -137,9 +137,31 @@ where
                     warn!("{}", f(e));
                     Ok(())
                 } else {
-                    Err(f(e))
+                    error!("{}", f(e));
+                    Err(CommandError::new(
+                        CommandErrorKind::Program,
+                        "Aborted".to_string(),
+                    ))
                 }
             }
         }
     }
+}
+
+pub async fn get_dir_entry(context: &ProgramContext, hash: &str) -> CommandResult<DirEntry> {
+    let mut dir_entry_buf = Vec::new(); // TODO: Setup a pool of buffers.
+    context
+        .storage
+        .read(Collection::Blob, hash, &mut dir_entry_buf)
+        .await
+        .into_command_result(CommandErrorKind::System, "Failed to download dir entry")?;
+    let dir_entry = DirEntry::decode(Cursor::new(dir_entry_buf)).map_err(|e| {
+        CommandError::with_source(
+            CommandErrorKind::Corrupt,
+            "Error decoding dir entry".to_string(),
+            Box::new(e),
+        )
+    })?;
+
+    return Ok(dir_entry);
 }

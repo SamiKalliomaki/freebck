@@ -45,19 +45,13 @@ macro_rules! storage_tests {
                 .storage
                 .write(Collection::Snapshot, "key_4", b"")
                 .await?;
-            _ = state
-                .storage
-                .write(Collection::Blob, "key_5", b"")
-                .await?;
+            _ = state.storage.write(Collection::Blob, "key_5", b"").await?;
 
             let mut snapshot_collection = state
                 .storage
                 .get_collection_items(Collection::Snapshot)
                 .await?;
-            let mut blob_collection = state
-                .storage
-                .get_collection_items(Collection::Blob)
-                .await?;
+            let mut blob_collection = state.storage.get_collection_items(Collection::Blob).await?;
 
             snapshot_collection.sort();
             blob_collection.sort();
@@ -91,7 +85,10 @@ macro_rules! storage_tests {
                 .await?;
 
             let mut buffer = Vec::new();
-            let res = state.storage.read(Collection::Snapshot, "key_2", &mut buffer).await;
+            let res = state
+                .storage
+                .read(Collection::Snapshot, "key_2", &mut buffer)
+                .await;
             match res {
                 Ok(_) => panic!("Expected not found"),
                 Err(err) => assert_eq!(err.kind(), io::ErrorKind::NotFound),

@@ -6,6 +6,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::time::SystemTime;
 use std::{collections::HashMap, path::Path, pin::pin};
+use tokio::sync::Semaphore;
 
 use futures::future::{try_join, try_join_all, BoxFuture};
 use tokio::{
@@ -49,17 +50,65 @@ pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResul
     info!("Backup starting");
     let started = as_unix_timestamp(SystemTime::now());
 
+    let previous_snapshot_number = get_highest_snapshot_number(context).await?;
+    let mut previous_snapshot_root: Option<DirEntry> = None;
+    if previous_snapshot_number > 0 {
+        let previous_snapshot_name =
+            format!("{}/{}", context.archive_name, previous_snapshot_number);
+        let mut previous_snapshot_buffer: Vec<u8> = Vec::new();
+        context
+            .storage
+            .read(
+                Collection::Snapshot,
+                &previous_snapshot_name,
+                &mut previous_snapshot_buffer,
+            )
+            .await
+            .into_command_result(CommandErrorKind::System, "Failed to get previous snapshot")?;
+
+        let previous_snapshot = Snapshot::decode(previous_snapshot_buffer.as_slice())
+            .into_command_result(CommandErrorKind::System, "Failed to decode snapshot")?;
+
+        let mut previous_root_buffer: Vec<u8> = Vec::new();
+        context
+            .storage
+            .read(
+                Collection::Blob,
+                &previous_snapshot.root_hash,
+                &mut previous_root_buffer,
+            )
+            .await
+            .into_command_result(
+                CommandErrorKind::System,
+                "Failed to get previous root entry",
+            )?;
+
+        previous_snapshot_root = Some(
+            DirEntry::decode(previous_root_buffer.as_slice())
+                .into_command_result(CommandErrorKind::System, "Failed to decode root entry")?,
+        );
+    }
+
     // Create a backup entry and write it to the storage.
-    let backup_root_entry = backup_dir(context, &args, &context.backup_target, None)
-        .await?
-        .encode_to_vec();
+    let backup_root_entry = backup_dir(
+        context,
+        &args,
+        &context.backup_target,
+        previous_snapshot_root.as_ref(),
+    )
+    .await?
+    .encode_to_vec();
     let root_hash = format!("{:x}", Sha256::digest(&backup_root_entry));
 
     context
         .storage
         .write(Collection::Blob, &root_hash, backup_root_entry.as_slice())
         .await
-        .ignore_already_exists()?;
+        .ignore_already_exists()
+        .into_command_result(
+            CommandErrorKind::System,
+            "Failed to upload backup root entry",
+        )?;
 
     let finished = as_unix_timestamp(SystemTime::now());
     let snapshot = Snapshot {
@@ -70,29 +119,10 @@ pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResul
 
     const MAX_LOOP_ITERATIONS: u32 = 100;
     for _ in 0..MAX_LOOP_ITERATIONS {
-        // Find the highest snapshot number.
-        let snapshots = context
-            .storage
-            .get_collection_items(Collection::Snapshot)
-            .await?;
-        let mut highest_snapshot: u32 = 0;
-        for snapshot_name in snapshots {
-            let parts: Vec<_> = snapshot_name.split('/').collect();
-            if parts.len() != 2 {
-                warn!("Invalid snapshot name: {}", snapshot_name);
-                continue;
-            }
-
-            if parts[0] != context.archive_config.name {
-                continue;
-            }
-            if let Ok(snapshot_number) = parts[1].parse::<u32>() {
-                highest_snapshot = highest_snapshot.max(snapshot_number);
-            }
-        }
+        let highest_snapshot = get_highest_snapshot_number(context).await?;
 
         // Create a snapshot entry and write it to the storage.
-        let snapshot_name = format!("{}/{}", context.archive_config.name, highest_snapshot + 1);
+        let snapshot_name = format!("{}/{}", context.archive_name, highest_snapshot + 1);
         match context
             .storage
             .write(
@@ -104,12 +134,15 @@ pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResul
         {
             Ok(_) => {
                 // Backup complete.
-                info!("Backup complete");
+                info!("Backup complete. Wrote snapshot: {}", snapshot_name);
                 return Ok(());
             }
             Err(e) => {
                 if e.kind() != io::ErrorKind::AlreadyExists {
-                    return Err(e.into());
+                    return Err(e.into_command_error(
+                        CommandErrorKind::System,
+                        "Failed to upload snapshot",
+                    ));
                 }
             }
         }
@@ -122,6 +155,31 @@ pub async fn backup(context: &ProgramContext, args: &BackupArgs) -> CommandResul
             MAX_LOOP_ITERATIONS
         ),
     ))
+}
+
+async fn get_highest_snapshot_number(context: &ProgramContext) -> CommandResult<u32> {
+    // Find the highest snapshot number.
+    let snapshots = context
+        .storage
+        .get_collection_items(Collection::Snapshot)
+        .await
+        .into_command_result(CommandErrorKind::System, "Failed to get snapshots")?;
+    let mut highest_snapshot: u32 = 0;
+    for snapshot_name in snapshots {
+        let parts: Vec<_> = snapshot_name.split('/').collect();
+        if parts.len() != 2 {
+            warn!("Invalid snapshot name: {}", snapshot_name);
+            continue;
+        }
+
+        if parts[0] != context.archive_name {
+            continue;
+        }
+        if let Ok(snapshot_number) = parts[1].parse::<u32>() {
+            highest_snapshot = highest_snapshot.max(snapshot_number);
+        }
+    }
+    Ok(highest_snapshot)
 }
 
 #[async_recursion]
@@ -153,11 +211,20 @@ async fn backup_dir(
     let mut file_futures: Vec<BoxFuture<CommandResult<FileEntry>>> = Vec::new();
     let mut sub_dir_futures: Vec<BoxFuture<CommandResult<SubDirTaskResult>>> = Vec::new();
 
-    let mut dir_entries = read_dir(path).await?;
-    while let Some(dir_entry) = dir_entries.next_entry().await? {
+    let mut dir_entries = read_dir(path).await.into_command_result(
+        CommandErrorKind::System,
+        format!("Failed to list directory entries in: {}", path.display()).as_str(),
+    )?;
+    while let Some(dir_entry) = dir_entries.next_entry().await.into_command_result(
+        CommandErrorKind::System,
+        format!("Failed to iterate directory entries in: {}", path.display()).as_str(),
+    )? {
         let name = sanitize_os_string(dir_entry.file_name())?;
         let path = dir_entry.path();
-        let file_type = dir_entry.file_type().await?;
+        let file_type = dir_entry.file_type().await.into_command_result(
+            CommandErrorKind::System,
+            format!("Failed to get file type: {}", path.display()).as_str(),
+        )?;
 
         if file_type.is_file() {
             let file_entry = previous_files.get(&name).copied();
@@ -165,16 +232,22 @@ async fn backup_dir(
                 backup_file(context, name, &args, &path, file_entry).await
             }));
         } else if file_type.is_dir() {
-            let sub_dir_entry: Option<&DirEntry> = match previous_sub_dirs.get(&name) {
-                Some(previous_sub_dir) => match previous_sub_dir.content {
-                    Some(Content::Inline(ref dir_entry)) => Some(dir_entry),
-                    Some(Content::Hash(_)) => todo!("fetch sub dir from storage"),
-                    None => None,
-                },
-                None => None,
-            };
-
+            let previous_sub_dirs = &previous_sub_dirs;
             sub_dir_futures.push(Box::pin(async move {
+                let fetched_sub_dir: DirEntry;
+
+                let sub_dir_entry: Option<&DirEntry> = match previous_sub_dirs.get(&name) {
+                    Some(ref previous_sub_dir) => match previous_sub_dir.content {
+                        Some(Content::Inline(ref dir_entry)) => Some(dir_entry),
+                        Some(Content::Hash(ref hash)) => {
+                            fetched_sub_dir = get_dir_entry(context, &hash).await?;
+                            Some(&fetched_sub_dir)
+                        }
+                        None => None,
+                    },
+                    None => None,
+                };
+
                 backup_dir(context, &args, &path, sub_dir_entry)
                     .await
                     .map(|dir_entry| SubDirTaskResult {
@@ -212,6 +285,8 @@ async fn backup_dir(
     })
 }
 
+static BACKUP_FILE_OPENS: Semaphore = Semaphore::const_new(16);
+
 async fn backup_file(
     context: &ProgramContext,
     name: String,
@@ -219,10 +294,15 @@ async fn backup_file(
     path: &Path,
     previous_snapshot: Option<&FileEntry>,
 ) -> CommandResult<FileEntry> {
-    debug!("Backing up file: {:}", path.display());
-
-    let metadata = fs::metadata(path).await?;
-    let modified = as_unix_timestamp(metadata.modified()?);
+    let metadata = fs::metadata(path).await.into_command_result(
+        CommandErrorKind::System,
+        format!("Failed to get file metadata: {}", path.display()).as_str(),
+    )?;
+    let modified = as_unix_timestamp(
+        metadata
+            .modified()
+            .into_command_result(CommandErrorKind::System, "Failed to get file modified time")?,
+    );
     let size = metadata.len();
 
     if let Some(previous_snapshot) = previous_snapshot {
@@ -231,8 +311,19 @@ async fn backup_file(
         }
     }
 
-    let mut file = pin!(File::open(path).await?);
-    let content_hash = read_hash(file.as_mut()).await?;
+    let _permit = BACKUP_FILE_OPENS.acquire().await.into_command_result(
+        CommandErrorKind::System,
+        "Failed to acquire file open permit",
+    )?;
+    debug!("Backing up file: {:}", path.display());
+
+    let mut file = pin!(File::open(path).await.into_command_result(
+        CommandErrorKind::System,
+        format!("Failed to open file: {}", path.display()).as_str()
+    )?);
+    let content_hash = read_hash(file.as_mut())
+        .await
+        .into_command_result(CommandErrorKind::System, "Failed to calculate file hash")?;
 
     if let Some(previous_snapshot) = previous_snapshot {
         if previous_snapshot.content_hash == content_hash {
@@ -246,7 +337,9 @@ async fn backup_file(
         }
     }
 
-    file.seek(io::SeekFrom::Start(0)).await?;
+    file.seek(io::SeekFrom::Start(0))
+        .await
+        .into_command_result(CommandErrorKind::System, "Failed to seek file")?;
     let mut buffer: Vec<u8> = vec![0; CHUNK_SIZE];
     let mut chunk_hashes = Vec::new();
 
@@ -254,7 +347,9 @@ async fn backup_file(
         let mut chunk = file.as_mut().take(CHUNK_SIZE as u64);
 
         buffer.clear();
-        io::copy(&mut chunk, &mut buffer).await?;
+        io::copy(&mut chunk, &mut buffer)
+            .await
+            .into_command_result(CommandErrorKind::System, "Failed to read file chunk")?;
         if buffer.len() == 0 {
             break;
         }
@@ -263,7 +358,9 @@ async fn backup_file(
         context
             .storage
             .write(Collection::Blob, &hash, &buffer)
-            .await?;
+            .await
+            .ignore_already_exists()
+            .into_command_result(CommandErrorKind::System, "Failed to upload file chunk")?;
         chunk_hashes.push(hash);
     }
 

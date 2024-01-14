@@ -1,6 +1,7 @@
 use std::{io::Cursor, os::unix::prelude::MetadataExt, path::PathBuf};
 
 use crate::{
+    cmd::common::{get_dir_entry, IntoCommandError, IntoCommandResult},
     data::backup::{sub_dir_entry, DirEntry, FileEntry, Snapshot, SubDirEntry},
     storage::Collection,
     util::time::{as_unix_timestamp, system_time_from_unix_timestamp},
@@ -33,7 +34,7 @@ pub struct RestoreArgs {
 pub async fn restore(context: &ProgramContext, args: &RestoreArgs) -> CommandResult {
     info!("Restore starting");
 
-    let snapshot_name = format!("{}/{}", context.archive_config.name, args.snapshot);
+    let snapshot_name = format!("{}/{}", context.archive_name, args.snapshot);
 
     let mut snapshot_buf = Vec::new();
     if let Err(e) = context
@@ -47,7 +48,9 @@ pub async fn restore(context: &ProgramContext, args: &RestoreArgs) -> CommandRes
                 format!("Snapshot not found {}", snapshot_name),
             ));
         } else {
-            return Err(e.into());
+            return Err(
+                e.into_command_error(CommandErrorKind::System, "Failed to download snapshot")
+            );
         }
     }
     let snapshot = Snapshot::decode(Cursor::new(snapshot_buf)).map_err(|e| {
@@ -79,7 +82,7 @@ async fn restore_dir(
             if !metadata.file_type().is_dir() {
                 Err(CommandError::new(
                     CommandErrorKind::FileSystemConflict,
-                    format!("Target exists and is not a directory {}", target.display()),
+                    "Target exists and is not a directory".to_string(),
                 ))
             } else {
                 Ok(())
@@ -87,10 +90,14 @@ async fn restore_dir(
         }
         Err(e) => match e.kind() {
             std::io::ErrorKind::NotFound => {
-                fs::create_dir(target).await?;
+                fs::create_dir(target)
+                    .await
+                    .into_command_result(CommandErrorKind::System, "Failed to create directory")?;
                 Ok(())
             }
-            _ => Err(e.into()),
+            _ => Err(
+                e.into_command_error(CommandErrorKind::System, "Failed to get directory metadata")
+            ),
         },
     }?;
 
@@ -218,7 +225,10 @@ async fn restore_file(
         open_options.create_new(true);
     }
 
-    let mut target_file = open_options.open(target_path).await?;
+    let mut target_file = open_options
+        .open(target_path)
+        .await
+        .into_command_result(CommandErrorKind::System, "Failed to open file for writing")?;
 
     let mut buffer = Vec::new(); // TODO: Setup a pool of buffers.
     for chunk_hash in chunk_hashes.into_iter() {
@@ -233,31 +243,22 @@ async fn restore_file(
                     Box::new(e),
                 )
             })?;
-        target_file.write_all(&buffer).await?;
+        target_file
+            .write_all(&buffer)
+            .await
+            .into_command_result(CommandErrorKind::System, "Failed to write chunk")?;
     }
 
     let target_file = target_file.into_std().await;
-    target_file.set_modified(system_time_from_unix_timestamp(modified)?)?;
+    target_file
+        .set_modified(system_time_from_unix_timestamp(modified)?)
+        .into_command_result(CommandErrorKind::System, "Failed to set modified time")?;
 
     let target_file = File::from_std(target_file);
-    target_file.sync_all().await?;
+    target_file
+        .sync_all()
+        .await
+        .into_command_result(CommandErrorKind::System, "Failed to sync changes")?;
 
     Ok(())
-}
-
-pub async fn get_dir_entry(context: &ProgramContext, hash: &str) -> CommandResult<DirEntry> {
-    let mut dir_entry_buf = Vec::new(); // TODO: Setup a pool of buffers.
-    context
-        .storage
-        .read(Collection::Blob, hash, &mut dir_entry_buf)
-        .await?;
-    let dir_entry = DirEntry::decode(Cursor::new(dir_entry_buf)).map_err(|e| {
-        CommandError::with_source(
-            CommandErrorKind::Corrupt,
-            format!("Error decoding dir entry: {}", e),
-            Box::new(e),
-        )
-    })?;
-
-    return Ok(dir_entry);
 }

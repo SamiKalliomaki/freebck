@@ -10,7 +10,7 @@ use freebck::{
         common::ProgramContext,
         restore::{restore, RestoreArgs},
     },
-    storage::file::FileStorage, data::config::ArchiveConfig,
+    storage::file::FileStorage,
 };
 
 #[test(tokio::test)]
@@ -24,9 +24,7 @@ async fn test_backup_and_restore() -> Result<(), Box<dyn Error>> {
 
     let storage = Box::new(FileStorage::new(backup_dir.path().into()).await.unwrap());
     let mut context = ProgramContext {
-        archive_config: ArchiveConfig {
-            name: "test".to_owned(),
-        },
+        archive_name: "test".to_owned(),
         storage,
         backup_target: content_path.clone(),
     };
